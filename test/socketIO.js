@@ -206,6 +206,38 @@ describe('SocketIO', () => {
                 deepStrictEqual(await getUser(io, socket), [null, 'admin', token.aExp]);
             });
 
+            it('uses the configured access-token cookie name', async () => {
+                const token = createToken('admin');
+                const { io, store } = createResolver({ 'a:token-1': token }, { accessTokenCookieName: 'web.0.access_token' });
+                const socket = createFakeSocket('a', {
+                    handshake: { headers: { cookie: 'foo=bar; web.0.access_token=token-1; baz=1' } },
+                });
+
+                deepStrictEqual(await getUser(io, socket), [null, 'admin', token.aExp]);
+                deepStrictEqual(store.requested, ['a:token-1']);
+            });
+
+            it('accepts a legacy access-token cookie and prefers the configured name', async () => {
+                const preferred = createToken('preferred');
+                const legacy = createToken('legacy');
+                const settings = {
+                    accessTokenCookieName: 'web.0.access_token',
+                    legacyAccessTokenCookieNames: ['access_token'],
+                };
+                const { io, store } = createResolver(
+                    { 'a:preferred-token': preferred, 'a:legacy-token': legacy },
+                    settings,
+                );
+                const socket = createFakeSocket('a', {
+                    handshake: {
+                        headers: { cookie: 'access_token=legacy-token; web.0.access_token=preferred-token' },
+                    },
+                });
+
+                deepStrictEqual(await getUser(io, socket), [null, 'preferred', preferred.aExp]);
+                deepStrictEqual(store.requested, ['a:preferred-token']);
+            });
+
             it('accepts a token from the query of the upgrade request', async () => {
                 // a browser that cannot set a cookie (different origin) sends it in the URL
                 const token = createToken('user');
@@ -274,6 +306,38 @@ describe('SocketIO', () => {
                 const [error, user] = await getUser(io, socket);
                 strictEqual(error, null);
                 strictEqual(user, 'admin');
+            });
+
+            it('uses the configured session cookie name in the header and query', async () => {
+                const settings = { sessionCookieName: 'web.0.sid' };
+                const { io: cookieIo } = createResolver({ 'session-1': createSession('admin') }, settings);
+                const cookie = signSessionCookie('session-1', SECRET).replace('connect.sid=', 'web.0.sid=');
+                const cookieSocket = createFakeSocket('a', { handshake: { headers: { cookie } } });
+                strictEqual((await getUser(cookieIo, cookieSocket))[1], 'admin');
+
+                const { io: queryIo } = createResolver({ 'session-1': createSession('admin') }, settings);
+                const querySocket = createFakeSocket('a', {
+                    handshake: { query: { 'web.0.sid': signSessionId('session-1', SECRET) } },
+                });
+                strictEqual((await getUser(queryIo, querySocket))[1], 'admin');
+            });
+
+            it('accepts a legacy session cookie name in the header and query', async () => {
+                const settings = {
+                    sessionCookieName: 'web.0.sid',
+                    legacySessionCookieNames: ['connect.sid'],
+                };
+                const { io: cookieIo } = createResolver({ 'session-1': createSession('admin') }, settings);
+                const cookieSocket = createFakeSocket('a', {
+                    handshake: { headers: { cookie: signSessionCookie('session-1', SECRET) } },
+                });
+                strictEqual((await getUser(cookieIo, cookieSocket))[1], 'admin');
+
+                const { io: queryIo } = createResolver({ 'session-1': createSession('admin') }, settings);
+                const querySocket = createFakeSocket('a', {
+                    handshake: { query: { 'connect.sid': signSessionId('session-1', SECRET) } },
+                });
+                strictEqual((await getUser(queryIo, querySocket))[1], 'admin');
             });
 
             it('url-decodes the cookie header before reading it', async () => {
@@ -415,6 +479,24 @@ describe('SocketIO', () => {
                 deepStrictEqual(store.requested, ['a:token-1']);
                 strictEqual(socket._sessionExpiresAt, renewed.aExp);
                 strictEqual(io.__updateSession(socket), true, 'the renewed token keeps the socket alive');
+            });
+
+            it('re-reads a renewed token from the configured cookie', async () => {
+                const renewed = createToken('admin');
+                const { io, store } = createSessionHandler({
+                    accessTokenCookieName: 'web.0.access_token',
+                    legacyAccessTokenCookieNames: ['access_token'],
+                });
+                store.sessions['a:token-1'] = renewed;
+                const socket = createFakeSocket('a', {
+                    _sessionExpiresAt: Date.now() - 20_000,
+                    conn: { request: { headers: { cookie: 'access_token=token-1' } } },
+                });
+
+                strictEqual(io.__updateSession(socket), false);
+                await wait(20);
+                deepStrictEqual(store.requested, ['a:token-1']);
+                strictEqual(socket._sessionExpiresAt, renewed.aExp);
             });
 
             it('leaves the expiration alone when the token is gone', async () => {

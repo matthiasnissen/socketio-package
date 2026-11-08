@@ -11,6 +11,7 @@ import {
     type Store,
     type SocketSubscribeTypes,
     type SocketIoOptions,
+    type SocketSettings,
     type InternalStorageToken,
 } from '@iobroker/socket-classes';
 import type { Socket as WebSocketClient, SocketACL, SocketIO as WebSocketServer } from '@iobroker/ws-server';
@@ -26,7 +27,24 @@ interface SocketIoExtended extends SocketIOConnection.Socket {
     _sessionTimer: NodeJS.Timeout | undefined;
 }
 
-// From settings used only secure, auth and crossDomain
+interface CookieNameSettings {
+    sessionCookieName?: string;
+    legacySessionCookieNames?: string[];
+    accessTokenCookieName?: string;
+    legacyAccessTokenCookieNames?: string[];
+}
+
+function getCookieValue(cookieHeader: string | undefined, cookieNames: string[]): string | undefined {
+    for (const cookieName of cookieNames) {
+        const cookie = cookieHeader?.split(';').find(part => part.trim().startsWith(`${cookieName}=`));
+        if (cookie) {
+            return cookie.trim().slice(cookieName.length + 1);
+        }
+    }
+    return undefined;
+}
+
+// Cookie names are inherited through SocketSettings and kept optional for compatibility with older package versions.
 /**
  * Extension of SocketCommon that specifically implements the server-side
  * socket.io logic for ioBroker. This class manages connected socket.io clients,
@@ -34,6 +52,22 @@ interface SocketIoExtended extends SocketIOConnection.Socket {
  * events outwards via socket.io.
  */
 export class SocketIO extends SocketCommon {
+    private get sessionCookieName(): string {
+        return (this.settings as SocketSettings & CookieNameSettings).sessionCookieName || 'connect.sid';
+    }
+
+    private get accessTokenCookieName(): string {
+        return (this.settings as SocketSettings & CookieNameSettings).accessTokenCookieName || 'access_token';
+    }
+
+    private get legacySessionCookieNames(): string[] {
+        return (this.settings as SocketSettings & CookieNameSettings).legacySessionCookieNames || [];
+    }
+
+    private get legacyAccessTokenCookieNames(): string[] {
+        return (this.settings as SocketSettings & CookieNameSettings).legacyAccessTokenCookieNames || [];
+    }
+
     /**
      * Internal store for ioBroker session ID mapping.
      */
@@ -149,19 +183,23 @@ export class SocketIO extends SocketCommon {
         let wait = false;
         try {
             let accessToken: string | undefined;
-            const textCookie: string | undefined =
-                socketIo.handshake.query['connect.sid'] || socketIo.handshake.headers.cookie;
+            const sessionCookieQuery = [this.sessionCookieName, ...this.legacySessionCookieNames]
+                .map(name => socketIo.handshake.query[name])
+                .find(Boolean);
+            const textCookie: string | undefined = socketIo.handshake.headers.cookie;
             let cookie: string | undefined;
             if (textCookie) {
                 cookie = decodeURIComponent(textCookie);
             }
             if (!socketIo.request || !socketIo.request._query?.user) {
-                if (cookie) {
-                    const accessTokens = cookie.split(';').find(c => c.trim().startsWith('access_token='));
-                    accessToken = accessTokens?.split('=')[1];
-                }
+                accessToken = getCookieValue(cookie, [
+                    this.accessTokenCookieName,
+                    ...this.legacyAccessTokenCookieNames,
+                ]);
                 if (!accessToken) {
-                    accessToken = socketIo.request?._query?.access_token;
+                    accessToken = [this.accessTokenCookieName, ...this.legacyAccessTokenCookieNames, 'access_token']
+                        .map(name => socketIo.request?._query?.[name])
+                        .find(Boolean);
                 }
             }
 
@@ -181,58 +219,50 @@ export class SocketIO extends SocketCommon {
                 });
             }
 
-            if (!wait && cookie) {
-                const m = cookie.match(/connect\.sid=(.+)/);
-                if (m || socketIo.handshake.query['connect.sid']) {
-                    let sessionID;
-
-                    // If session cookie exists
-                    if (socketIo.handshake.query['connect.sid']) {
-                        sessionID = cookieParser.signedCookie(socketIo.handshake.query['connect.sid'], this.secret);
-                    } else {
-                        const c = m![1].split(';')[0];
-                        sessionID = cookieParser.signedCookie(c, this.secret);
-                    }
-                    if (sessionID) {
-                        // Get user for session
-                        wait = true;
-                        this.store?.get(
-                            sessionID,
-                            (
-                                _err: Error | null,
-                                obj?: {
-                                    cookie: {
-                                        originalMaxAge: number;
-                                        expires: string;
-                                        httpOnly: boolean;
-                                        path: string;
-                                    };
-                                    passport: {
-                                        user: string;
-                                    };
-                                },
-                            ): void => {
-                                if (obj?.passport?.user) {
-                                    socketIo._sessionID = sessionID;
-                                    if (typeof callback === 'function') {
-                                        callback(
-                                            null,
-                                            obj.passport.user,
-                                            obj.cookie.expires ? new Date(obj.cookie.expires).getTime() : 0,
-                                        );
-                                    } else {
-                                        this.adapter.log.warn('[_getUserFromSocket] Invalid callback');
-                                    }
-                                } else {
-                                    if (typeof callback === 'function') {
-                                        callback('unknown user');
-                                    } else {
-                                        this.adapter.log.warn('[_getUserFromSocket] Invalid callback');
-                                    }
-                                }
+            const sessionCookie =
+                sessionCookieQuery ||
+                getCookieValue(cookie, [this.sessionCookieName, ...this.legacySessionCookieNames]);
+            if (!wait && sessionCookie) {
+                const sessionID = cookieParser.signedCookie(sessionCookie, this.secret);
+                if (sessionID) {
+                    // Get user for session
+                    wait = true;
+                    this.store?.get(
+                        sessionID,
+                        (
+                            _err: Error | null,
+                            obj?: {
+                                cookie: {
+                                    originalMaxAge: number;
+                                    expires: string;
+                                    httpOnly: boolean;
+                                    path: string;
+                                };
+                                passport: {
+                                    user: string;
+                                };
                             },
-                        );
-                    }
+                        ): void => {
+                            if (obj?.passport?.user) {
+                                socketIo._sessionID = sessionID;
+                                if (typeof callback === 'function') {
+                                    callback(
+                                        null,
+                                        obj.passport.user,
+                                        obj.cookie.expires ? new Date(obj.cookie.expires).getTime() : 0,
+                                    );
+                                } else {
+                                    this.adapter.log.warn('[_getUserFromSocket] Invalid callback');
+                                }
+                            } else {
+                                if (typeof callback === 'function') {
+                                    callback('unknown user');
+                                } else {
+                                    this.adapter.log.warn('[_getUserFromSocket] Invalid callback');
+                                }
+                            }
+                        },
+                    );
                 }
             }
 
@@ -316,12 +346,12 @@ export class SocketIO extends SocketCommon {
             // Check socket expiration time
             if (socket._sessionExpiresAt < Date.now() - 10_000) {
                 // If less than 10 seconds, then recheck the socket
-                const accessToken = socket.conn.request.headers?.cookie
-                    ?.split(';')
-                    .find(c => c.trim().startsWith('access_token='));
+                const tokenStr = getCookieValue(socket.conn.request.headers?.cookie, [
+                    this.accessTokenCookieName,
+                    ...this.legacyAccessTokenCookieNames,
+                ]);
 
-                if (accessToken) {
-                    const tokenStr = accessToken.split('=')[1];
+                if (tokenStr) {
                     void this.store?.get(`a:${tokenStr}`, (err: Error, token: any): void => {
                         const tokenData = token as InternalStorageToken;
                         if (err) {
